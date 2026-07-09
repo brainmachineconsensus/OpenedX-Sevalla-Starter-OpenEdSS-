@@ -1,0 +1,24 @@
+#!/bin/sh
+# Run edx-platform management commands from a shell that did not go through the
+# entrypoint (Sevalla's web terminal opens a new process in a running
+# container, so the rendered YAML may not exist yet).
+#
+#   openedx-manage lms migrate
+#   openedx-manage cms migrate
+#   openedx-manage lms createsuperuser
+set -e
+python /openedx/bin/render_config.py
+cd /openedx/edx-platform
+
+variant="$1"
+shift
+case "$variant" in
+    lms|cms) ;;
+    *) echo "usage: openedx-manage {lms|cms} <command> [args...]" >&2; exit 64 ;;
+esac
+
+# --settings names a module under <variant>/envs and takes precedence over
+# DJANGO_SETTINGS_MODULE, which the image pins to the lms variant. Without it,
+# manage.py would fall back to lms.envs.devstack.
+export SERVICE_VARIANT="$variant"
+exec ./manage.py "$variant" --settings=sevalla.production "$@"
