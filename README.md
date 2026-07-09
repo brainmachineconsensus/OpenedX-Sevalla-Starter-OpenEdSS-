@@ -14,7 +14,8 @@ AGPLv3 — see [LICENSE](LICENSE).
 | `Dockerfile` | Extends `overhangio/openedx:21.0.8`, adds the settings modules and entrypoint. |
 | `uwsgi.ini` | Replaces the base image's, which hardcodes port 8000. Binds `$(PORT)` and picks `lms/wsgi.py` or `cms/wsgi.py` from `$(SERVICE_VARIANT)`. |
 | `bin/render_config.py` | Writes `/openedx/config/{lms,cms}.env.yml` from environment variables, at every boot. |
-| `bin/sevalla-entrypoint.sh` | Renders the config, then execs uwsgi. The image's `ENTRYPOINT`. |
+| `bin/migrate_once.py` | Runs `lms migrate` and `cms migrate` under a MySQL advisory lock, so concurrent container boots serialise instead of racing. Only when `RUN_MIGRATIONS_ON_BOOT=true`. |
+| `bin/sevalla-entrypoint.sh` | Renders the config, optionally migrates, then execs uwsgi. The image's `ENTRYPOINT`. |
 | `bin/openedx-manage` | Wrapper for `manage.py`. Use it in Sevalla's web terminal. |
 | `settings/common_all.py` | Settings shared by both variants that YAML cannot express. |
 | `settings/lms_production.py` | Copied to `lms/envs/sevalla/production.py`. |
@@ -52,8 +53,25 @@ openssl rand -hex 32          # -> OPENEDX_SECRET_KEY
 openssl genrsa 2048           # -> JWT_RSA_PRIVATE_KEY (paste the whole PEM)
 ```
 
-Both must be identical across the LMS and Studio apps, and stable across
-restarts. A changed JWT key invalidates every issued token.
+Hex rather than base64 for the secret key: any high-entropy value works, but `/`
+and `+` are awkward to move through shells and dashboard fields.
+
+Set both as environment variables on **each app**, with identical values.
+`render_config.py` reads them from the environment at every boot, so they are
+runtime variables, not build arguments — rotating one is a restart, not a
+rebuild. Neither has a default: a missing or empty value aborts the container at
+boot with a named error.
+
+`OPENEDX_SECRET_KEY` becomes Django's `SECRET_KEY`, which `common_all.py` then
+reuses as `JWT_AUTH['JWT_SECRET_KEY']`; the signing JWKs are derived from
+`JWT_RSA_PRIVATE_KEY`. The LMS signs tokens and Studio verifies them, so if the
+two apps disagree on either value, Studio's OAuth2 login fails at verification.
+
+Store both in a password manager or secret store, not only in the Sevalla
+dashboard. Rotating `OPENEDX_SECRET_KEY` invalidates every session and every
+outstanding password-reset link; rotating `JWT_RSA_PRIVATE_KEY` invalidates every
+issued token. Nothing is lost — users log in again — but change them on both apps
+in the same maintenance window, or Studio stays broken until the values match.
 
 ## Deploy as two Sevalla apps
 
@@ -134,6 +152,8 @@ Optional, with defaults:
 | `MFE_ORIGINS` | *(empty)* — comma-separated origins **with scheme**, e.g. `https://apps.example.com`. Added to CORS and CSRF. |
 | `SESSION_COOKIE_DOMAIN` | the app's own host — a host-only cookie. Set to a shared parent (`.yourdomain.com`) only on a domain you own, and only when you need MFE auth. Rejected for `sevalla.app`. |
 | `EXTRA_ALLOWED_HOSTS` | *(empty)* — comma-separated extra `ALLOWED_HOSTS` entries, e.g. an internal health-check hostname. |
+| `RUN_MIGRATIONS_ON_BOOT` | `false` — run migrations in the entrypoint, under a lock. See First run. |
+| `MIGRATION_LOCK_TIMEOUT` | `900` — seconds to wait for the migration lock. |
 | `MYSQL_PORT` | `3306` |
 | `MONGODB_PORT` / `MONGODB_DATABASE` | `27017` / `openedx` |
 | `MONGODB_AUTH_SOURCE` / `MONGODB_USE_SSL` | `admin` / `true` |
@@ -215,6 +235,9 @@ SMTP_USE_TLS=true
 MAX_ASSET_UPLOAD_FILE_SIZE_IN_MB=100
 UWSGI_WORKERS=2
 
+RUN_MIGRATIONS_ON_BOOT=false             # see First run; turn on to bootstrap
+MIGRATION_LOCK_TIMEOUT=900
+
 # ─── Optional, empty by default ──────────────────────────────────────────────
 MFE_ORIGINS=                             # https://apps.example.com,https://learn.example.com
 SESSION_COOKIE_DOMAIN=                   # leave unset on *.sevalla.app domains
@@ -241,14 +264,53 @@ both apps**, or Studio's tokens will be rejected by the LMS.
 
 ## First run
 
-Sevalla's web terminal opens a process that never passed through the entrypoint,
-so use the wrapper — it renders the config first.
+The database has to be migrated before either app can serve a request — Django
+apps evaluate waffle switches while loading, which queries MySQL, and
+`need-app = true` in `uwsgi.ini` makes that failure fatal. An unmigrated
+deployment therefore crash-loops rather than starting and returning 500s. That is
+deliberate, but it means there is no running pod to open a terminal in, so a
+fresh deployment cannot be bootstrapped from the web terminal alone.
+
+### Bootstrapping a fresh database
+
+Set, on the **LMS app only**:
+
+```
+RUN_MIGRATIONS_ON_BOOT=true
+CMS_OAUTH2_KEY=<same value as the Studio app>
+CMS_OAUTH2_SECRET=<same value as the Studio app>
+```
+
+The OAuth variables are needed because `cms migrate` imports
+`cms/envs/sevalla/production.py`, which reads them at module level. They are
+inert on the LMS app; nothing but Studio's login flow uses them.
+
+Deploy. The entrypoint runs `migrate_once.py`, which takes a MySQL advisory lock
+named after the database, runs `lms migrate` then `cms migrate`, releases the
+lock, and hands off to uwsgi. Concurrent boots — the Studio app, a second replica
+— block on the lock rather than racing, and find nothing to do once they get it.
+
+**Then unset `RUN_MIGRATIONS_ON_BOOT`.** Building edx-platform's migration graph
+costs tens of seconds on every container start, even when there is nothing to
+apply. Leave it off in steady state and turn it back on when you upgrade to a new
+Open edX release.
+
+### Running migrations by hand
+
+Once an app is up, its web terminal works. The terminal opens a process that
+never passed through the entrypoint, so use the wrapper — it renders the config
+first:
 
 ```sh
 openedx-manage lms migrate
 openedx-manage cms migrate
 openedx-manage lms createsuperuser
 ```
+
+Run `cms migrate` from the **Studio app's** terminal, or from an LMS app that has
+`CMS_OAUTH2_KEY` and `CMS_OAUTH2_SECRET` set, for the reason above.
+
+`createsuperuser` has no equivalent on-boot switch and must be run this way.
 
 Then, so Studio can log in through the LMS, create a Django OAuth Toolkit
 application at `https://<LMS_HOST>/admin/oauth2_provider/application/`:
