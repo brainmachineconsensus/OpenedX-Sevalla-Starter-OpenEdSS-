@@ -33,8 +33,7 @@ COPY settings/cms_production.py cms/envs/sevalla/production.py
 
 # Overrides the base image's uwsgi.ini, which hardcodes port 8000.
 COPY uwsgi.ini /openedx/uwsgi.ini
-COPY bin/render_config.py bin/migrate_once.py \
-     bin/sevalla-entrypoint.sh bin/openedx-manage /openedx/bin/
+COPY bin/render_config.py bin/sevalla-entrypoint.sh bin/openedx-manage /openedx/bin/
 
 RUN chmod +x /openedx/bin/sevalla-entrypoint.sh /openedx/bin/openedx-manage \
     && mkdir -p /openedx/config /openedx/data/logs /openedx/media \

@@ -14,8 +14,7 @@ AGPLv3 — see [LICENSE](LICENSE).
 | `Dockerfile` | Extends `overhangio/openedx:21.0.8`, adds the settings modules and entrypoint. |
 | `uwsgi.ini` | Replaces the base image's, which hardcodes port 8000. Binds `$(PORT)` and picks `lms/wsgi.py` or `cms/wsgi.py` from `$(SERVICE_VARIANT)`. |
 | `bin/render_config.py` | Writes `/openedx/config/{lms,cms}.env.yml` from environment variables, at every boot. |
-| `bin/migrate_once.py` | Runs `lms migrate` and `cms migrate` under a MySQL advisory lock, so concurrent container boots serialise instead of racing. Only when `RUN_MIGRATIONS_ON_BOOT=true`. |
-| `bin/sevalla-entrypoint.sh` | Renders the config, optionally migrates, then execs uwsgi. The image's `ENTRYPOINT`. |
+| `bin/sevalla-entrypoint.sh` | Renders the config, then execs uwsgi. The image's `ENTRYPOINT`. |
 | `bin/openedx-manage` | Wrapper for `manage.py`. Use it in Sevalla's web terminal. |
 | `settings/common_all.py` | Settings shared by both variants that YAML cannot express. |
 | `settings/lms_production.py` | Copied to `lms/envs/sevalla/production.py`. |
@@ -83,6 +82,33 @@ Both use the same image. They differ only in these variables:
 | `DJANGO_SETTINGS_MODULE` | `lms.envs.sevalla.production` (default) | `cms.envs.sevalla.production` |
 
 Sevalla sets `PORT` itself.
+
+### Connect the datastores to both apps
+
+In Sevalla, a managed MySQL, Redis or Object Storage resource has to be
+explicitly connected to an application before that application can reach it on
+the internal network. **Do this for the LMS app and the Studio app.** Both talk to
+MySQL, Redis and Mongo directly; Studio is not proxied through the LMS, and shares
+its database rather than asking the LMS for data.
+
+Use the **internal** connection details. Sevalla also exposes an external endpoint
+for each database, on a different hostname and a non-3306 port, meant for
+connecting from a laptop. Pointing `MYSQL_HOST` at the external hostname while
+leaving `MYSQL_PORT` at its `3306` default gets you:
+
+```
+MySQLdb.OperationalError: (2013, "Lost connection to MySQL server at
+'reading initial communication packet', system error: 0")
+```
+
+That error occurs *before* authentication, so it never means a bad username,
+password or database name — it means nothing that speaks MySQL is listening where
+you pointed it. The database and both apps also have to be in the same region;
+internal networking does not cross regions.
+
+Whatever Sevalla injects when you connect a resource, `render_config.py` reads
+only `MYSQL_HOST`, `MYSQL_DATABASE`, `MYSQL_USERNAME`, `MYSQL_PASSWORD`,
+`REDIS_HOST` and the `S3_*` names, so those are the ones that must end up set.
 
 ### Domains
 
@@ -152,8 +178,6 @@ Optional, with defaults:
 | `MFE_ORIGINS` | *(empty)* — comma-separated origins **with scheme**, e.g. `https://apps.example.com`. Added to CORS and CSRF. |
 | `SESSION_COOKIE_DOMAIN` | the app's own host — a host-only cookie. Set to a shared parent (`.yourdomain.com`) only on a domain you own, and only when you need MFE auth. Rejected for `sevalla.app`. |
 | `EXTRA_ALLOWED_HOSTS` | *(empty)* — comma-separated extra `ALLOWED_HOSTS` entries, e.g. an internal health-check hostname. |
-| `RUN_MIGRATIONS_ON_BOOT` | `false` — run migrations in the entrypoint, under a lock. See First run. |
-| `MIGRATION_LOCK_TIMEOUT` | `900` — seconds to wait for the migration lock. |
 | `MYSQL_PORT` | `3306` |
 | `MONGODB_PORT` / `MONGODB_DATABASE` | `27017` / `openedx` |
 | `MONGODB_AUTH_SOURCE` / `MONGODB_USE_SSL` | `admin` / `true` |
@@ -235,9 +259,6 @@ SMTP_USE_TLS=true
 MAX_ASSET_UPLOAD_FILE_SIZE_IN_MB=100
 UWSGI_WORKERS=2
 
-RUN_MIGRATIONS_ON_BOOT=false             # see First run; turn on to bootstrap
-MIGRATION_LOCK_TIMEOUT=900
-
 # ─── Optional, empty by default ──────────────────────────────────────────────
 MFE_ORIGINS=                             # https://apps.example.com,https://learn.example.com
 SESSION_COOKIE_DOMAIN=                   # leave unset on *.sevalla.app domains
@@ -264,42 +285,40 @@ both apps**, or Studio's tokens will be rejected by the LMS.
 
 ## First run
 
-The database has to be migrated before either app can serve a request — Django
-apps evaluate waffle switches while loading, which queries MySQL, and
-`need-app = true` in `uwsgi.ini` makes that failure fatal. An unmigrated
-deployment therefore crash-loops rather than starting and returning 500s. That is
-deliberate, but it means there is no running pod to open a terminal in, so a
-fresh deployment cannot be bootstrapped from the web terminal alone.
+Migrations are run by hand, once, against the database. They are deliberately not
+in the entrypoint: that script runs once per *container*, and a deployment has at
+least two of them plus any replicas. Django takes no cross-process lock, so
+concurrent `migrate` runs race, and the loser can leave a table created but not
+recorded as applied.
 
-### Bootstrapping a fresh database
+### Getting a shell on an unmigrated deployment
 
-Set, on the **LMS app only**:
+An unmigrated deployment crash-loops. Django apps evaluate waffle switches while
+loading, which queries MySQL; the table does not exist yet; and `need-app = true`
+in `uwsgi.ini` makes a failed app import fatal rather than letting uwsgi serve
+500s from a container that looks healthy. Good behaviour, but it means there is
+no live pod to attach a web terminal to:
 
 ```
-RUN_MIGRATIONS_ON_BOOT=true
-CMS_OAUTH2_KEY=<same value as the Studio app>
-CMS_OAUTH2_SECRET=<same value as the Studio app>
+Error: Connection closed: There is no alive pod to connect to (code 4001)
 ```
 
-The OAuth variables are needed because `cms migrate` imports
-`cms/envs/sevalla/production.py`, which reads them at module level. They are
-inert on the LMS app; nothing but Studio's login flow uses them.
+Break the loop by overriding the app's start command with something that never
+imports Django. The `ENTRYPOINT` is fixed in the image, so the config is still
+rendered and a missing variable still fails loudly:
 
-Deploy. The entrypoint runs `migrate_once.py`, which takes a MySQL advisory lock
-named after the database, runs `lms migrate` then `cms migrate`, releases the
-lock, and hands off to uwsgi. Concurrent boots — the Studio app, a second replica
-— block on the lock rather than racing, and find nothing to do once they get it.
+```sh
+sh -c 'python -m http.server "$PORT"'
+```
 
-**Then unset `RUN_MIGRATIONS_ON_BOOT`.** Building edx-platform's migration graph
-costs tens of seconds on every container start, even when there is nothing to
-apply. Leave it off in steady state and turn it back on when you upgrade to a new
-Open edX release.
+This binds `$PORT`, so the health check passes and the pod stays up. Redeploy,
+open the terminal, migrate, then restore the start command to
+`uwsgi /openedx/uwsgi.ini`.
 
-### Running migrations by hand
+### Migrating
 
-Once an app is up, its web terminal works. The terminal opens a process that
-never passed through the entrypoint, so use the wrapper — it renders the config
-first:
+The web terminal opens a process that never passed through the entrypoint, so use
+the wrapper — it renders the config first:
 
 ```sh
 openedx-manage lms migrate
@@ -307,10 +326,11 @@ openedx-manage cms migrate
 openedx-manage lms createsuperuser
 ```
 
-Run `cms migrate` from the **Studio app's** terminal, or from an LMS app that has
-`CMS_OAUTH2_KEY` and `CMS_OAUTH2_SECRET` set, for the reason above.
-
-`createsuperuser` has no equivalent on-boot switch and must be run this way.
+Run `cms migrate` from the **Studio app's** terminal. On the LMS app it fails with
+`required environment variable CMS_OAUTH2_KEY is not set`, because
+`cms/envs/sevalla/production.py` reads that variable at import time even though no
+migration touches OAuth. Setting `CMS_OAUTH2_KEY` and `CMS_OAUTH2_SECRET` on the
+LMS app too is a harmless workaround — nothing there reads them.
 
 Then, so Studio can log in through the LMS, create a Django OAuth Toolkit
 application at `https://<LMS_HOST>/admin/oauth2_provider/application/`:
